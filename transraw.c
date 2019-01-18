@@ -34,6 +34,7 @@ int usage(void)
 		"transraw -l br-lan -o /tmp/output -s \"/usr/sbin/transraw-script\"\n"
 		"transraw -b br-lan -f /etc/config/devsetup -t 5 -s \"/usr/sbin/transraw-script\"\n"
 		"transraw -r br-lan -f /etc/config/wireless -m ff:ff:ff:ff:ff:ff -o /tmp/output -s \"/usr/sbin/transraw-script\"\n"
+		"transraw -b br-lan -x \"This string is what I Send.\" -t 5 -s \"/usr/sbin/transraw-script\"\n"
 		"\nFeature options:\n"
 		"       -f      The file name which is requested or broadcasted\n"
 		"       -m      Destination Mac\n"
@@ -43,6 +44,7 @@ int usage(void)
 		"       -l      listen on which interface\n"
 		"       -b      broadcast on which interface\n"
 		"       -t      timeout (seconds)\n"
+		"       -x      send text\n"
 		"       -h      Show this help\n\n";
 	fputs(buf, stderr);
 	return 1;
@@ -77,18 +79,12 @@ void genfile(uint8_t *data, ssize_t len, char *output)
 	FILE *fp = NULL;
 	char cmd[BUFSIZ] = {};
 
-	fp = fopen(DECODE_FILE, "w");
+	fp = fopen(output, "w");
 	if (!fp)
 		return;
 
 	fwrite(data, 1, len, fp);
 	fclose(fp);
-
-	/*TODO openssl lib*/
-	sprintf(cmd, "openssl enc -aes-256-cbc -pass pass:'zXcVfr@Wsadeq!#' -in %s -out %s -d", DECODE_FILE, output);
-	system(cmd);
-
-	unlink(DECODE_FILE);
 }
 
 int genrand(void)
@@ -182,11 +178,10 @@ int sendconfig(int sockfd, char *ifname, void *data, unsigned int len, u_char *m
 	return 0;
 }
 
-void broadcast_mode(int sockfd, char *ifname, char *filename, int timeout, char *script)
+void broadcast_mode(int sockfd, char *ifname, char *text, int datatype, int timeout, char *script)
 {
 	int i;
 	ssize_t numbytes;
-	uint8_t buf[BUFSIZ];
 	uint16_t msgid;
 	void *data = malloc(BUFSIZ);
 	FILE *fp = NULL;
@@ -195,6 +190,7 @@ void broadcast_mode(int sockfd, char *ifname, char *filename, int timeout, char 
 	u_char mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 	genpid(TRANSRAW_BCST_PID);
+	memset(data, 0, BUFSIZ);
 
 	/* Bind to device */
 	if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, ifname, IFNAMSIZ-1) == -1) {
@@ -205,15 +201,17 @@ void broadcast_mode(int sockfd, char *ifname, char *filename, int timeout, char 
 
 	/*every broadcast packet message ID should be the same*/
 	msgid = genrand() % 0xffff;
+	if (datatype == 0) {
+		strcpy(data, text);
+		len = strlen(data);
+	} else if (datatype == 1) {
 
-	sprintf(cmd, "openssl enc -aes-256-cbc -pass pass:'zXcVfr@Wsadeq!#' -in %s -out %s -e", filename, ENCODE_FILE);
-	system(cmd);
+		fp = fopen(text, "r");
+		if (!fp)
+			goto exit;
 
-	fp = fopen(ENCODE_FILE, "r");
-	if (!fp)
-		goto exit;
-
-	len = fread(data, 1, BUFSIZ, fp);
+		len = fread(data, 1, BUFSIZ, fp);
+	}
 
 	while (timeout != 0) {
 		sendconfig(sockfd, ifname, data, len, mac, F_BROADCAST, msgid);
@@ -225,7 +223,8 @@ void broadcast_mode(int sockfd, char *ifname, char *filename, int timeout, char 
 
 	callback(script, F_BROADCAST);
 
-	fclose(fp);
+	if (fp)
+		fclose(fp);
 exit:
 	unlink(TRANSRAW_BCST_PID);
 	unlink(ENCODE_FILE);
@@ -398,10 +397,7 @@ void listen_mode(int sockfd, char *ifname, char *output, char *script)
 
 			msgid = genrand() % 0xffff;
 
-			sprintf(cmd, "openssl enc -aes-256-cbc -pass pass:'zXcVfr@Wsadeq!#' -in %s -out %s -e", &buf[PAYLOAD_OFFSET], ENCODE_FILE);
-			system(cmd);
-
-			fp = fopen(ENCODE_FILE, "r");
+			fp = fopen(&buf[PAYLOAD_OFFSET], "r");
 			if (!fp)
 				goto exit;
 
@@ -522,10 +518,9 @@ int main(int argc, char *argv[])
 	struct ether_header *eh = (struct ether_header *) sendbuf;
 	struct sockaddr_ll socket_address;
 	char ifname[IFNAMSIZ];
-	char filename[BUFSIZ];
 	char output[BUFSIZ];
 	ssize_t numbytes;
-	uint8_t buf[BUFSIZ];
+	char text[BUFSIZ];
 	int i = 0, c;
 	u_char mac[6];
 	char cmd[BUFSIZ] = {};
@@ -535,13 +530,19 @@ int main(int argc, char *argv[])
 	int broadcast = 0;
 	int request = 0;
 	int timeout = 0;
+	int datatype = -1; //0:string 1:file
 	char *p;
 
 	/*FIXME check valid arg?*/
-	while ((c = getopt(argc, argv, "f:m:o:r:l:s:t:b:h")) != -1) {
+	while ((c = getopt(argc, argv, "f:m:o:r:l:s:t:b:x:h")) != -1) {
 		switch (c) {
+		case 'x':
+			datatype = 0;
+			strcpy(text, optarg);
+			break;
 		case 'f':
-			strcpy(filename, optarg);
+			datatype = 1;
+			strcpy(text, optarg);
 			break;
 		case 'm':
 			p = strtok(optarg, ":");
@@ -586,12 +587,13 @@ int main(int argc, char *argv[])
 		return 0;
 	}
 
-	if (listen == 1)
+	if (listen == 1) {
 		listen_mode(sockfd, ifname, output, script);
-	else if (broadcast == 1)
-		broadcast_mode(sockfd, ifname, filename, timeout, script);
-	else if (request == 1)
-		request_mode(sockfd, ifname, filename, mac, output, timeout, script);
+	} else if (broadcast == 1) {
+			broadcast_mode(sockfd, ifname, text, datatype, timeout, script);
+	} else if (request == 1) {
+		request_mode(sockfd, ifname, text, mac, output, timeout, script);
+	}
 
 	if (sockfd != -1)
 		close(sockfd);
